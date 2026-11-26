@@ -35,6 +35,15 @@ final class PhotosEvidence {
         return false;
     }
 
+    static boolean backupDisabled(Collection<String> labels) {
+        for (String label : labels) {
+            String text=label.toLowerCase(Locale.ROOT);
+            if (text.equals("backup is off") || text.equals("backup off") || text.equals("백업 꺼짐")
+                    || text.equals("백업이 사용 중지됨")) return true;
+        }
+        return false;
+    }
+
     static final class Item {
         String name = "";
         boolean backedUp, original, conflicts;

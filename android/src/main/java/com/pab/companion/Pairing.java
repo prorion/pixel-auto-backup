@@ -28,19 +28,22 @@ final class Pairing {
 
     static String join(String address, String entered, String device) throws Exception {
         String code = PairCode.normalize(entered);
-        if (!PairCode.valid(code)) throw new IOException("연결 코드 12자를 입력해 주세요.");
+        if (!PairCode.valid(code)) throw new IOException("연결 코드 6자를 입력해 주세요.");
         URL endpoint = endpoint(address);
         AtomicReference<String> discovered = new AtomicReference<>();
-        JSONObject challenge = request(Link.direct(endpoint, "/v1/pair/challenge", Link.tls(null, discovered)), null);
+        PairCode.Session session = new PairCode.Session();
+        JSONObject begin = new JSONObject().put("device",device).put("a",Link.hex(PairCode.pad(session.A)));
+        JSONObject challenge = request(Link.direct(endpoint, "/v1/pair/start", Link.tls(null, discovered)), begin);
         String pin = discovered.get();
-        String nonce = challenge.getString("nonce");
-        if (pin == null || !nonce.matches("[A-Za-z0-9_-]{43}")) throw new IOException("PC 연결 정보가 올바르지 않습니다.");
+        String id = challenge.getString("id");
+        if (pin == null || !id.matches("[A-Za-z0-9_-]{43}")) throw new IOException("PC 연결 정보가 올바르지 않습니다.");
 
-        String proof = Link.hex(PairCode.proof(code, "phone", pin, nonce, device, ""));
-        JSONObject payload = new JSONObject().put("device",device).put("nonce",nonce).put("proof",proof);
+        byte[] key = session.key(code,challenge.getString("salt"),challenge.getString("b"));
+        String proof = Link.hex(PairCode.proof(key, "phone", pin, id, device, ""));
+        JSONObject payload = new JSONObject().put("device",device).put("id",id).put("proof",proof);
         JSONObject result = request(Link.direct(endpoint, "/v1/pair", Link.tls(pin, null)), payload);
         String token = result.getString("token");
-        String expected = Link.hex(PairCode.proof(code, "pc", pin, nonce, device, token));
+        String expected = Link.hex(PairCode.proof(key, "pc", pin, id, device, token));
         if (!token.matches("[A-Za-z0-9_-]{43}") || !MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
                 result.getString("proof").getBytes(StandardCharsets.US_ASCII))) {
             throw new IOException("PC가 연결 코드를 인증하지 못했습니다.");

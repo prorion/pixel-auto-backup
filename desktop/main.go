@@ -233,11 +233,60 @@ func (c *controller) pairAddress(ip, mode string) (string, error) {
 	return net.JoinHostPort(ip, strconv.Itoa(c.dataPort)), nil
 }
 
+type videoReader struct {
+	file    *os.File
+	c       *controller
+	startID string
+}
+
+func (r videoReader) Seek(offset int64, whence int) (int64, error) {
+	return r.file.Seek(offset, whence)
+}
+
+func (r videoReader) Read(data []byte) (int, error) {
+	r.c.mu.Lock()
+	allowed := r.c.s.Running && r.c.report.Accessible && r.c.s.StartID == r.startID
+	r.c.mu.Unlock()
+	if !allowed {
+		return 0, errors.New("전송 일시 중지")
+	}
+	return r.file.Read(data)
+}
+
+func (c *controller) setRunning(enable bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if enable {
+		if c.last.IsZero() || time.Since(c.last) > time.Duration(c.s.Settings.Interval*4)*time.Second {
+			return errors.New("픽셀을 연결한 뒤 전송을 시작하세요.")
+		}
+		if !c.report.Accessible {
+			return errors.New("픽셀에서 오토픽셀 접근성 서비스를 켜 주세요.")
+		}
+		p := c.s.progress(c.report)
+		if p.TotalCount == 0 {
+			return errors.New("전송할 영상이 없습니다. 백업 설정에서 폴더를 선택하세요.")
+		}
+		if !p.Active && p.TotalCount == p.VerifiedCount {
+			return errors.New("모든 영상이 확인되었습니다. 새 파일을 검색하세요.")
+		}
+		if !c.s.Running {
+			c.s.StartID = randomKey()
+		}
+	}
+	c.s.Running = enable
+	return c.save()
+}
+
 func (c *controller) phone() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/sync", func(w http.ResponseWriter, r *http.Request) {
 		var p report
 		if !body(w, r, &p) {
+			return
+		}
+		if p.Version != 3 {
+			http.Error(w, "픽셀의 오토픽셀 앱을 0.3 이상으로 업데이트하세요.", http.StatusUpgradeRequired)
 			return
 		}
 		device := r.Header.Get("X-Device")
@@ -261,7 +310,15 @@ func (c *controller) phone() http.Handler {
 		if c.s.apply(p) {
 			changed = true
 		}
-		newBatch, reason := c.s.reserve(c.report.Free)
+		newBatch, reason := false, ""
+		if c.s.Running && p.Accessible {
+			newBatch, reason = c.s.reserve(c.report.Free)
+		}
+		view := c.s.progress(c.report)
+		if c.s.Running && !view.Active && view.TotalCount > 0 && view.TotalCount == view.VerifiedCount {
+			c.s.Running = false
+			changed = true
+		}
 		if changed || newBatch {
 			if err := c.save(); err != nil {
 				http.Error(w, err.Error(), 500)
@@ -269,13 +326,19 @@ func (c *controller) phone() http.Handler {
 			}
 		}
 		writeJSON(w, map[string]any{"active": c.s.Active, "videos": c.s.activeFiles(), "interval": c.s.Settings.Interval,
-			"reserve": c.s.Settings.ReserveGB * GB, "account": c.s.Settings.Account, "message": reason})
+			"reserve": c.s.Settings.ReserveGB * GB, "account": c.s.Settings.Account, "message": reason,
+			"version": 3, "running": c.s.Running, "startId": c.s.StartID, "progress": view})
 	})
 	mux.HandleFunc("GET /v1/file/{id}", func(w http.ResponseWriter, r *http.Request) {
 		c.mu.Lock()
 		if c.s.Device == "" || c.s.Device != r.Header.Get("X-Device") {
 			c.mu.Unlock()
 			http.Error(w, "픽셀 연결을 확인해 주세요.", 403)
+			return
+		}
+		if !c.s.Running || !c.report.Accessible {
+			c.mu.Unlock()
+			http.Error(w, "PC에서 전송이 대기 중입니다.", http.StatusLocked)
 			return
 		}
 		var found *video
@@ -291,7 +354,7 @@ func (c *controller) phone() http.Handler {
 			return
 		}
 		v := *found
-		root := c.s.Settings.Root
+		root, startID := c.s.Settings.Root, c.s.StartID
 		c.mu.Unlock()
 		f, err := source(root, &v)
 		if err != nil {
@@ -320,10 +383,10 @@ func (c *controller) phone() http.Handler {
 		}
 		w.Header().Set("X-File-SHA256", v.SHA)
 		w.Header().Set("Content-Type", "application/octet-stream")
-		http.ServeContent(w, r, v.Name, time.Unix(0, v.ModTime), f)
+		http.ServeContent(w, r, v.Name, time.Unix(0, v.ModTime), videoReader{file: f, c: c, startID: startID})
 	})
 	outer := http.NewServeMux()
-	outer.HandleFunc("GET /v1/pair/challenge", c.challenge)
+	outer.HandleFunc("POST /v1/pair/start", c.beginPair)
 	outer.HandleFunc("POST /v1/pair", c.completePair)
 	outer.Handle("/", auth(c.key, mux))
 	return outer

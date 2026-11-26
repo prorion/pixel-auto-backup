@@ -18,7 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class TransferService extends Service {
     static final String PHOTOS = "com.google.android.apps.photos";
-    static final String DIRECTORY = "Movies/PixelAutoBackup/";
+    static final String DIRECTORY = "DCIM/Camera/";
+    static final String LEGACY_DIRECTORY = "Movies/PixelAutoBackup/";
+    static final String ACTION_PHOTOS = "com.pab.companion.OPEN_PHOTOS";
     private static final Uri VIDEOS = MediaStore.Video.Media.getContentUri("external_primary");
     private static final String COL_NAME = MediaStore.MediaColumns.DISPLAY_NAME;
     private static final String COL_PATH = MediaStore.MediaColumns.RELATIVE_PATH;
@@ -36,9 +38,15 @@ public final class TransferService extends Service {
     private volatile long bytes;
     private volatile long accountUntil;
     private volatile String confirmedAccount = "";
-    private volatile boolean pendingReported;
+    private volatile Work lastWork;
+    private volatile boolean pcRunning;
+    private volatile long lastConnected;
+    private volatile JSONObject totals = new JSONObject();
+    private volatile String prompt = "";
+    private volatile String inspectionHint = "";
+    private String notificationText = "";
     private long last;
-    private int interval = 15;
+    private volatile int interval = 15;
     private SharedPreferences prefs;
 
     static final class Clip {
@@ -76,6 +84,7 @@ public final class TransferService extends Service {
         prefs = getSharedPreferences("job", MODE_PRIVATE);
         NotificationManager manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel("transfer", "백업 진행", NotificationManager.IMPORTANCE_LOW));
+        manager.createNotificationChannel(new NotificationChannel("photos", "구글 포토 백업 안내", NotificationManager.IMPORTANCE_HIGH));
         running = this;
         syncThread.scheduleWithFixedDelay(this::checkIn, 1, 1, TimeUnit.SECONDS);
     }
@@ -86,11 +95,20 @@ public final class TransferService extends Service {
                 .setContentTitle("오토픽셀").setContentText("PC와 백업 상태 동기화 중")
                 .setSmallIcon(android.R.drawable.stat_sys_upload).setContentIntent(pending).build());
         try {
+            if (!PhotosInspector.ready()) {
+                stopSelf();
+                return START_NOT_STICKY;
+            }
             String token = Pairing.device(prefs);
             Link next = new Link(prefs.getString("pair", ""), token);
             if (link != null && !link.namespace.equals(next.namespace)) {
                 confirmedAccount = "";
                 work = null;
+                lastWork = null;
+                lastConnected = 0;
+                totals = new JSONObject();
+                pcRunning = false;
+                prompt = "";
             }
             link = next;
             changed.set(true);
@@ -102,7 +120,9 @@ public final class TransferService extends Service {
     }
     @Override public IBinder onBind(Intent intent) { return null; }
     @Override public void onDestroy() {
-        running = null;
+        if (running == this) running = null;
+        link = null;
+        getSystemService(NotificationManager.class).cancel(126);
         syncThread.shutdownNow();
         ioThread.shutdownNow();
         super.onDestroy();
@@ -130,18 +150,134 @@ public final class TransferService extends Service {
             changed.set(true);
         }
     }
-    String status() {
-        String extra = network.isEmpty() ? "" : "\n" + network;
-        return message + extra;
+    void accessibilityChanged() { changed.set(true); }
+
+    private void requestPhotos(Link active, String id) {
+        if (id.isEmpty() || id.equals(prefs.getString(active.namespace + ".lastPrompt",""))) return;
+        if (!prefs.edit().putString(active.namespace + ".lastPrompt",id).commit()) return;
+        prompt = id;
+        Intent open = new Intent(this,MainActivity.class).setAction(ACTION_PHOTOS)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pending = PendingIntent.getActivity(this,126,open,PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        getSystemService(NotificationManager.class).notify(126,new Notification.Builder(this,"photos")
+                .setContentTitle("오토픽셀 · 구글 포토 열기")
+                .setContentText("PC에서 전송을 시작했어요. 탭하면 백업 확인을 시작해요.")
+                .setSmallIcon(android.R.drawable.stat_sys_upload).setContentIntent(pending).setAutoCancel(true).build());
+    }
+
+    String consumePrompt() {
+        String value = prompt;
+        prompt = "";
+        if (!value.isEmpty()) getSystemService(NotificationManager.class).cancel(126);
+        return value;
+    }
+
+    private String storagePath(Work w, Clip c) {
+        String fallback = uri(w,c) == null ? DIRECTORY : LEGACY_DIRECTORY;
+        String path = prefs.getString(w.key(c) + ".path",fallback);
+        return DIRECTORY.equals(path) ? DIRECTORY : LEGACY_DIRECTORY;
+    }
+
+    static final class Received {
+        final String name, path;
+        final Uri uri;
+        final int stage;
+        Received(String name,String path,Uri uri,int stage) {
+            this.name=name;
+            this.path=path;
+            this.uri=uri;
+            this.stage=stage;
+        }
+    }
+
+    List<Received> received() {
+        Work w = work != null ? work : lastWork;
+        List<Received> files = new ArrayList<>();
+        if (w != null) for (Clip c : w.clips) {
+            int stage=stage(w,c);
+            if (stage>0) files.add(new Received(c.name,storagePath(w,c),uri(w,c),stage));
+        }
+        return files;
+    }
+    boolean waitingForAccount() {
+        Work w=work;
+        return w!=null && (w.cleanup || nextUnverified()!=null) && !readyToInspect();
+    }
+    void inspectionHint(String hint) {
+        if (!inspectionHint.equals(hint)) {
+            inspectionHint=hint;
+            changed.set(true);
+        }
+    }
+    private String currentNote() {
+        if (!network.isEmpty()) return network;
+        if (work != null && nextUnverified()!=null && current.isEmpty()
+                && unlocked(this) && !inspectionHint.isEmpty()) return inspectionHint;
+        return message;
+    }
+
+    String connectionText() {
+        if (lastConnected==0) return "PC 연결 대기";
+        if (SystemClock.elapsedRealtime()-lastConnected>4_000L*interval) return "PC 응답 지연";
+        return "PC 연결됨";
+    }
+
+    String counts() {
+        JSONObject view=totals;
+        int total=view.optInt("totalCount"), verifiedCount=view.optInt("verifiedCount");
+        long copiedBytes=view.optLong("batchReceived"), batchBytes=view.optLong("batchBytes");
+        int batchCount=view.optInt("batchCount"), copiedCount=view.optInt("batchCopied");
+        Work w=work;
+        if (w!=null && w.batch==view.optInt("batchNumber")) {
+            int localCopied=0, localVerified=0;
+            long localBytes=0;
+            for (Clip c:w.clips) {
+                int state=stage(w,c);
+                if (state>=1) {localCopied++; localBytes+=c.size;}
+                else if(c.id.equals(current)) localBytes+=Math.min(c.size,bytes);
+                if (state>=2) localVerified++;
+            }
+            copiedBytes=Math.max(copiedBytes,localBytes);
+            copiedCount=Math.max(copiedCount,localCopied);
+            verifiedCount+=Math.max(0,localVerified-view.optInt("batchVerified"));
+        }
+        String bundle=batchCount>0 ? String.format(java.util.Locale.KOREA,"이번 묶음 전송 %,d / %,d개 · %.2f / %.2f GB",
+                copiedCount,batchCount,copiedBytes/1e9,batchBytes/1e9) : "현재 묶음 없음";
+        return bundle+"\n원본 백업 확인 "+Math.min(total,verifiedCount)+" / "+total+"개";
+    }
+
+    private void updateNotification() {
+        if (running!=this) return;
+        String value=counts();
+        String note=currentNote();
+        if (value.equals(notificationText)) return;
+        notificationText=value;
+        Intent open=new Intent(this,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent target=PendingIntent.getActivity(this,0,open,PendingIntent.FLAG_IMMUTABLE);
+        getSystemService(NotificationManager.class).notify(125,new Notification.Builder(this,"transfer")
+                .setContentTitle("오토픽셀 · "+connectionText())
+                .setContentText(value.replace("\n"," · ")).setStyle(new Notification.BigTextStyle().bigText(value+"\n"+note))
+                .setSmallIcon(android.R.drawable.stat_sys_upload).setContentIntent(target)
+                .setOnlyAlertOnce(true).setOngoing(true).build());
+    }
+
+    String status() { return currentNote(); }
+
+    String lastChecked() {
+        Link active=link;
+        long stamp=active==null?0:prefs.getLong(active.namespace+".lastVerified",0);
+        stamp=Math.max(stamp, totals.optLong("lastVerified")*1000);
+        return stamp>0 ? "마지막 백업 확인 "+android.text.format.DateFormat.getTimeFormat(this).format(new Date(stamp)) : "백업 확인 대기";
     }
     boolean readyToInspect() { return accountOK(work); }
     String expectedAccount() { Work w = work; return w == null ? "" : w.account; }
     void confirmAccount(String account) {
         Work w = work;
         if (w != null && w.account.equalsIgnoreCase(account)) {
+            boolean first = !accountOK(w);
             confirmedAccount = w.account;
             accountUntil = SystemClock.elapsedRealtime() + TimeUnit.MINUTES.toMillis(30);
-            setMessage("백업 계정 확인 · 구글 포토에서 이번 묶음 영상의 세부정보를 열어 주세요.");
+            if (first) setMessage("구글 포토 백업 계정 확인 · 영상별 원본 확인 중");
         }
     }
     void clearAccountProof() {
@@ -150,7 +286,9 @@ public final class TransferService extends Service {
     }
     private int stage(Work w, Clip c) { return prefs.getInt(w.key(c) + ".stage", 0); }
     private void stage(Work w, Clip c, int value) throws IOException {
-        if (!prefs.edit().putInt(w.key(c) + ".stage", value).commit()) {
+        SharedPreferences.Editor editor=prefs.edit().putInt(w.key(c) + ".stage", value);
+        if (value==2) editor.putLong(w.namespace+".lastVerified",System.currentTimeMillis());
+        if (!editor.commit()) {
             throw new IOException("파일 진행 기록을 저장할 수 없습니다.");
         }
         changed.set(true);
@@ -205,50 +343,71 @@ public final class TransferService extends Service {
             if (stage > 0) receipts.put(c.id,stage);
         }
         Intent battery = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        return report.put("batch",w==null?0:w.batch).put("files",receipts)
+        return report.put("version",3).put("accessible",PhotosInspector.ready())
+                .put("batch",w==null?0:w.batch).put("files",receipts)
                 .put("current",current).put("bytes",bytes).put("free",free())
                 .put("locked",!unlocked(this)).put("charging",battery != null
                         && battery.getIntExtra(BatteryManager.EXTRA_PLUGGED,0) != 0)
-                .put("message",message);
+                .put("message",currentNote());
     }
     private void checkIn() {
         Link activeLink = link;
         if (activeLink == null) return;
         long now = SystemClock.elapsedRealtime();
-        if (now-last < interval*1000L && (!changed.get() || now-last < 2000)) return;
+        boolean urgent=changed.getAndSet(false);
+        if (now-last < (pcRunning?interval:Math.min(2,interval))*1000L && !urgent) return;
         last = now;
-        changed.set(false);
+        if (!PhotosInspector.ready()) setMessage("접근성 꺼짐 · 픽셀에서 접근성 서비스를 켜 주세요.");
         try {
             Work previous = work;
             JSONObject response = activeLink.sync(makeReport(previous));
             if (activeLink != link) return;
+            if (response.optInt("version")!=3) throw new IOException("윈도우 오토픽셀도 0.3으로 업데이트해 주세요.");
             interval = Math.max(5, Math.min(120,response.optInt("interval",15)));
             network = "";
+            lastConnected=SystemClock.elapsedRealtime();
+            pcRunning=response.optBoolean("running");
+            JSONObject view=response.optJSONObject("progress");
+            if (view!=null) totals=view;
+            if (pcRunning && PhotosInspector.ready()) requestPhotos(activeLink,response.optString("startId"));
             if (response.isNull("active")) {
                 work = null;
                 if (!busy.get()) {
                     String reason=response.optString("message");
-                    setMessage(reason.isEmpty() ? "PC 연결됨 · 작업 대기 중" : reason);
+                    if (!PhotosInspector.ready()) setMessage("접근성 꺼짐 · 픽셀에서 접근성 서비스를 켜 주세요.");
+                    else if (totals.optInt("totalCount")>0 && totals.optInt("verifiedCount")==totals.optInt("totalCount"))
+                        setMessage("전체 백업 확인 완료");
+                    else setMessage(reason.isEmpty() ? "PC에서 전송 시작을 기다리는 중" : reason);
                 }
                 return;
             }
             Work next = new Work(response,activeLink);
+            if (previous==null || previous.batch!=next.batch) {
+                inspectionHint="";
+                current="";
+                bytes=0;
+            }
             work = next;
+            lastWork=next;
+            if (!PhotosInspector.ready()) return;
             if (!busy.compareAndSet(false,true)) return;
             ioThread.execute(() -> process(activeLink,next));
         } catch (Exception error) {
             network = "PC 통신 대기 · " + safeMessage(error);
+        } finally {
+            updateNotification();
         }
     }
     private void process(Link activeLink, Work w) {
         try {
+            if (!PhotosInspector.ready()) return;
             if (w.cleanup) {
                 if (!accountOK(w)) {
                     setMessage("정리 전 대기 · 구글 포토의 백업 설정에서 계정을 다시 확인해 주세요.");
                     return;
                 }
                 for (Clip c : w.clips) {
-                    if (activeLink != link || Thread.currentThread().isInterrupted()) return;
+                    if (activeLink != link || !PhotosInspector.ready() || Thread.currentThread().isInterrupted()) return;
                     if (stage(w,c) == 3) continue;
                     if (stage(w,c) != 2) throw new IOException("기기에 확인 기록이 없어 정리를 보류했습니다.");
                     remove(w,c);
@@ -258,8 +417,12 @@ public final class TransferService extends Service {
             }
             boolean allVerified = true;
             for (Clip c : w.clips) {
-                if (activeLink != link || Thread.currentThread().isInterrupted()) return;
+                if (activeLink != link || !PhotosInspector.ready() || Thread.currentThread().isInterrupted()) return;
                 if (stage(w,c) < 1) {
+                    if (!pcRunning) {
+                        setMessage("PC에서 전송 시작을 기다리는 중");
+                        return;
+                    }
                     setMessage("전송 중 · " + c.name);
                     copy(activeLink,w,c);
                 }
@@ -267,13 +430,11 @@ public final class TransferService extends Service {
             }
             if (allVerified) setMessage("묶음 백업 확인 완료 · 정리 대기");
             else if (!unlocked(this)) setMessage("화면 잠금 · 잠금 해제 후 백업 확인");
-            else if (!accountOK(w)) setMessage("구글 포토의 백업 설정에서 계정을 확인해 주세요.");
-            else setMessage("구글 포토에서 백업 및 영상 세부정보 확인 대기");
+            else if (!accountOK(w)) setMessage("구글 포토 열기 · 백업 계정 확인 대기");
+            else setMessage("수신 완료 · 구글 포토에서 영상별 원본 백업 확인 중");
         } catch (Exception error) {
             setMessage(safeMessage(error));
         } finally {
-            current = "";
-            bytes = 0;
             busy.set(false);
         }
     }
@@ -282,7 +443,7 @@ public final class TransferService extends Service {
         try (Cursor cursor = getContentResolver().query(MediaStore.setIncludePending(target),
                 new String[]{COL_NAME,COL_PATH,COL_PENDING},null,null,null)) {
             return cursor != null && cursor.moveToFirst() && c.name.equals(cursor.getString(0))
-                    && DIRECTORY.equals(cursor.getString(1)) && (allowPending || cursor.getInt(2) == 0);
+                    && storagePath(w,c).equals(cursor.getString(1)) && (allowPending || cursor.getInt(2) == 0);
         }
     }
     private Uri prepare(Work w, Clip c) throws IOException {
@@ -291,10 +452,11 @@ public final class TransferService extends Service {
             if (!sameOwnedItem(w,c,target,true)) throw new IOException("전송 기록의 영상 위치가 바뀌었습니다.");
             return target;
         }
+        String path=storagePath(w,c);
         // Only this scoped-storage app’s own rows are visible without a media read permission.
         try (Cursor existing = getContentResolver().query(MediaStore.setIncludePending(VIDEOS),
                 new String[]{MediaStore.MediaColumns._ID,COL_PENDING},
-                COL_NAME + "=? AND " + COL_PATH + "=?",new String[]{c.name,DIRECTORY},null)) {
+                COL_NAME + "=? AND " + COL_PATH + "=?",new String[]{c.name,path},null)) {
             if (existing != null && existing.moveToFirst()) {
                 if (existing.getInt(1) != 1) throw new IOException("같은 이름의 기기 파일이 있어 전송을 보류했습니다.");
                 target = ContentUris.withAppendedId(VIDEOS,existing.getLong(0));
@@ -304,7 +466,7 @@ public final class TransferService extends Service {
         if (target == null) {
             ContentValues values = new ContentValues();
             values.put(COL_NAME,c.name);
-            values.put(COL_PATH,DIRECTORY);
+            values.put(COL_PATH,path);
             String ext = c.name.substring(c.name.lastIndexOf('.')+1);
             String mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
             values.put(MediaStore.MediaColumns.MIME_TYPE,mime != null && mime.startsWith("video/") ? mime : "video/*");
@@ -312,7 +474,7 @@ public final class TransferService extends Service {
             target = getContentResolver().insert(VIDEOS,values);
             if (target == null) throw new IOException("픽셀에서 영상 파일을 만들 수 없습니다.");
         }
-        if (!prefs.edit().putString(w.key(c)+".uri",target.toString()).commit()) {
+        if (!prefs.edit().putString(w.key(c)+".uri",target.toString()).putString(w.key(c)+".path",path).commit()) {
             throw new IOException("기기 미디어 ID를 저장할 수 없습니다.");
         }
         if (!sameOwnedItem(w,c,target,true)) throw new IOException("픽셀 영상 이름 또는 폴더가 다릅니다.");
@@ -348,7 +510,7 @@ public final class TransferService extends Service {
                         byte[] buffer=new byte[256*1024];
                         int count;
                         while ((count=input.read(buffer))!=-1) {
-                            if (activeLink!=link || Thread.currentThread().isInterrupted()) throw new InterruptedIOException("전송 일시 중지");
+                            if (activeLink!=link || !pcRunning || !PhotosInspector.ready() || Thread.currentThread().isInterrupted()) throw new InterruptedIOException("전송 일시 중지");
                             if (count>c.size-bytes) throw new IOException("전송 바이트가 원본 크기를 넘었습니다.");
                             ByteBuffer data=ByteBuffer.wrap(buffer,0,count);
                             while(data.hasRemaining())channel.write(data);

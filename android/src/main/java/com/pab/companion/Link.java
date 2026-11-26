@@ -100,6 +100,7 @@ final class Link {
             conn.setFixedLengthStreamingMode(data.length);
             try (java.io.OutputStream out = conn.getOutputStream()) { out.write(data); }
             int status = conn.getResponseCode();
+            if (status == 426) throw new IOException("윈도우와 픽셀 앱을 같은 버전으로 업데이트해 주세요.");
             if (status != 200) throw new IOException("윈도우 응답 " + status);
             try (InputStream in = conn.getInputStream()) {
                 return new JSONObject(new String(read(in, 4 << 20), StandardCharsets.UTF_8));

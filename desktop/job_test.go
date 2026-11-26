@@ -28,6 +28,7 @@ func TestRestartAndResumeRange(t *testing.T) {
 	s.Files = files
 	s.Settings.ReserveGB = 0
 	s.Device = "registered-device"
+	s.Running = true
 	s.reserve(GB)
 	path := filepath.Join(dir, "job.json")
 	if err = store(path, s); err != nil {
@@ -37,7 +38,7 @@ func TestRestartAndResumeRange(t *testing.T) {
 	if err != nil || restored.Active == nil || restored.Active.ID != 1 || len(restored.Files) != 1 {
 		t.Fatalf("reload: %+v %v", restored, err)
 	}
-	c := controller{s: restored, statePath: path, key: "test"}
+	c := controller{s: restored, statePath: path, key: "test", report: report{Accessible: true}}
 	r := httptest.NewRequest("GET", "/v1/file/"+files[0].ID, nil)
 	r.Header.Set("Authorization", "Bearer test")
 	r.Header.Set("X-Device", s.Device)
@@ -101,7 +102,7 @@ func TestSyncRequiresAuthenticationAndKnownDevice(t *testing.T) {
 	server := httptest.NewServer(c.phone())
 	defer server.Close()
 	call := func(key, device string) (int, string) {
-		data, _ := json.Marshal(report{})
+		data, _ := json.Marshal(report{Version: 3})
 		r, _ := http.NewRequest("POST", server.URL+"/v1/sync", strings.NewReader(string(data)))
 		if key != "" {
 			r.Header.Set("Authorization", "Bearer "+key)
@@ -126,5 +127,69 @@ func TestSyncRequiresAuthenticationAndKnownDevice(t *testing.T) {
 	}
 	if code, text := call("secret", s.Device); code != 200 || !strings.Contains(text, "\"interval\":15") {
 		t.Fatalf("paired phone: %d %s", code, text)
+	}
+}
+
+func TestPairThenExplicitStartAndPause(t *testing.T) {
+	s := newState()
+	s.Device = "waiting-pixel-instance"
+	s.Settings.ReserveGB = 0
+	s.Files = []*video{{ID: "vid", Size: 100}}
+	c := controller{s: s, key: "test", statePath: filepath.Join(t.TempDir(), "job.json")}
+	handler := c.phone()
+	post := func(access bool) map[string]any {
+		data, _ := json.Marshal(report{Version: 3, Accessible: access, Free: GB})
+		req := httptest.NewRequest("POST", "/v1/sync", strings.NewReader(string(data)))
+		req.Header.Set("Authorization", "Bearer test")
+		req.Header.Set("X-Device", s.Device)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("sync: %d", w.Code)
+		}
+		var response map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	requestFile := func() int {
+		req := httptest.NewRequest("GET", "/v1/file/vid", nil)
+		req.Header.Set("Authorization", "Bearer test")
+		req.Header.Set("X-Device", s.Device)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		return w.Code
+	}
+	if response := post(false); response["active"] != nil {
+		t.Fatal("connection started transfer")
+	}
+	if err := c.setRunning(true); err == nil {
+		t.Fatal("started while accessibility was off")
+	}
+	if response := post(true); response["active"] != nil || response["running"] != false {
+		t.Fatal("accessibility started transfer")
+	}
+	if err := c.setRunning(true); err != nil {
+		t.Fatal(err)
+	}
+	if response := post(true); response["active"] == nil || response["running"] != true || response["startId"] == "" {
+		t.Fatalf("missing explicit start: %v", response)
+	}
+	if err := c.setRunning(false); err != nil {
+		t.Fatal(err)
+	}
+	if code := requestFile(); code != http.StatusLocked {
+		t.Fatalf("paused file access: %d", code)
+	}
+	if response := post(true); response["active"] == nil || response["running"] != false {
+		t.Fatal("pause lost staging batch")
+	}
+	if err := c.setRunning(true); err != nil {
+		t.Fatal(err)
+	}
+	post(false)
+	if code := requestFile(); code != http.StatusLocked {
+		t.Fatalf("permission-off file access: %d", code)
 	}
 }

@@ -50,6 +50,8 @@ type batch struct {
 	Cleanup bool     `json:"cleanup"`
 }
 type state struct {
+	Running  bool     `json:"running"`
+	StartID  string   `json:"startId"`
 	Settings settings `json:"settings"`
 	Files    []*video `json:"files"`
 	Skipped  []string `json:"skipped"`
@@ -58,14 +60,16 @@ type state struct {
 	Sequence int      `json:"sequence"`
 }
 type report struct {
-	Batch    int            `json:"batch"`
-	Files    map[string]int `json:"files"`
-	Current  string         `json:"current"`
-	Bytes    int64          `json:"bytes"`
-	Free     int64          `json:"free"`
-	Locked   bool           `json:"locked"`
-	Charging bool           `json:"charging"`
-	Message  string         `json:"message"`
+	Version    int            `json:"version"`
+	Accessible bool           `json:"accessible"`
+	Batch      int            `json:"batch"`
+	Files      map[string]int `json:"files"`
+	Current    string         `json:"current"`
+	Bytes      int64          `json:"bytes"`
+	Free       int64          `json:"free"`
+	Locked     bool           `json:"locked"`
+	Charging   bool           `json:"charging"`
+	Message    string         `json:"message"`
 }
 type progress struct {
 	TotalCount    int    `json:"totalCount"`

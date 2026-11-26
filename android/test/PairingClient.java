@@ -7,7 +7,7 @@ public final class PairingClient {
         String device = args[2];
         String stored = Pairing.join(args[0], args[1], device);
         Link link = new Link(stored, device);
-        if (link.sync(new JSONObject().put("free", 1_000_000_000)).getInt("interval") != 15) {
+        if (link.sync(new JSONObject().put("version", 3).put("free", 1_000_000_000)).getInt("interval") != 15) {
             throw new AssertionError("Paired client could not sync");
         }
     }
