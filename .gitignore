@@ -3,3 +3,5 @@
 /android/local.properties
 *.jks
 *.keystore
+
+/desktop/*.syso

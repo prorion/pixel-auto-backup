@@ -1,6 +1,6 @@
 package com.pab.companion;
 
-import android.util.Base64;
+import java.util.Base64;
 import org.json.JSONObject;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
@@ -9,6 +9,8 @@ import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
+import java.net.Proxy;
+import java.util.concurrent.atomic.AtomicReference;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.cert.CertificateException;
@@ -27,7 +29,7 @@ final class Link {
         }
         this.id = id;
         JSONObject config = new JSONObject(new String(
-                Base64.decode(code.substring(5), Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP),
+                Base64.getUrlDecoder().decode(code.substring(5)),
                 StandardCharsets.UTF_8));
         endpoint = new URL(config.getString("url"));
         token = config.getString("token");
@@ -38,6 +40,10 @@ final class Link {
             throw new IOException("페어링 주소를 확인해 주세요.");
         }
         namespace = pin.substring(0, 20);
+        tls = tls(pin, null);
+    }
+
+    static SSLContext tls(String pin, AtomicReference<String> captured) throws Exception {
         TrustManager[] trust = {new X509TrustManager() {
             @Override public void checkClientTrusted(X509Certificate[] chain, String type) throws CertificateException {
                 throw new CertificateException("Server certificate required");
@@ -47,9 +53,12 @@ final class Link {
                     if (chain == null || chain.length == 0) throw new CertificateException("PC certificate missing");
                     chain[0].checkValidity();
                     String actual = hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
-                    if (!MessageDigest.isEqual(pin.getBytes(StandardCharsets.US_ASCII),
+                    if (pin != null && !MessageDigest.isEqual(pin.getBytes(StandardCharsets.US_ASCII),
                             actual.getBytes(StandardCharsets.US_ASCII))) {
                         throw new CertificateException("PC certificate fingerprint changed");
+                    }
+                    if (captured != null && !captured.compareAndSet(null, actual) && !actual.equals(captured.get())) {
+                        throw new CertificateException("PC certificate changed during pairing");
                     }
                 } catch (CertificateException e) {
                     throw e;
@@ -59,17 +68,24 @@ final class Link {
             }
             @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
         }};
-        tls = SSLContext.getInstance("TLS");
+        SSLContext tls = SSLContext.getInstance("TLS");
         tls.init(null, trust, null);
+        return tls;
     }
-    HttpsURLConnection connect(String path) throws IOException {
-        HttpsURLConnection conn = (HttpsURLConnection) new URL(endpoint, path).openConnection();
+
+    static HttpsURLConnection direct(URL endpoint, String path, SSLContext tls) throws IOException {
+        HttpsURLConnection conn = (HttpsURLConnection) new URL(endpoint, path).openConnection(Proxy.NO_PROXY);
         conn.setSSLSocketFactory(tls.getSocketFactory());
-        // The certificate pin replaces CA-based hostname authentication for this specific PC.
+        // Pairing authenticates the captured certificate. Subsequent requests require that exact pin.
         conn.setHostnameVerifier((host, session) -> host.equals(endpoint.getHost()));
         conn.setInstanceFollowRedirects(false);
         conn.setConnectTimeout(8000);
         conn.setReadTimeout(20000);
+        return conn;
+    }
+
+    HttpsURLConnection connect(String path) throws IOException {
+        HttpsURLConnection conn = direct(endpoint, path, tls);
         conn.setRequestProperty("Authorization", "Bearer " + token);
         conn.setRequestProperty("X-Device", id);
         return conn;

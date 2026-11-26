@@ -83,14 +83,10 @@ public final class TransferService extends Service {
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent pending = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE);
         startForeground(125, new Notification.Builder(this, "transfer")
-                .setContentTitle("Pixel Auto Backup").setContentText("PC와 백업 상태 동기화 중")
+                .setContentTitle("오토픽셀").setContentText("PC와 백업 상태 동기화 중")
                 .setSmallIcon(android.R.drawable.stat_sys_upload).setContentIntent(pending).build());
         try {
-            String token = prefs.getString("device", "");
-            if (token.isEmpty()) {
-                token = UUID.randomUUID().toString();
-                prefs.edit().putString("device", token).commit();
-            }
+            String token = Pairing.device(prefs);
             Link next = new Link(prefs.getString("pair", ""), token);
             if (link != null && !link.namespace.equals(next.namespace)) {
                 confirmedAccount = "";

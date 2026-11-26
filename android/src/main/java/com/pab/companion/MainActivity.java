@@ -8,17 +8,19 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.text.InputFilter;
+import android.text.InputType;
 import android.view.View;
 import android.widget.*;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 
 public final class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private LinearLayout page;
-    private EditText code;
-    private TextView status, diagnostic;
+    private EditText address, code;
+    private TextView status, diagnostic, pairingStatus;
+    private Button pairButton, resume;
     private SharedPreferences prefs;
+    private boolean pairing;
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
             TransferService s = TransferService.running;
@@ -40,17 +42,29 @@ public final class MainActivity extends Activity {
         page.setPadding(pad,pad,pad,pad);
         scroll.addView(page);
         setContentView(scroll);
-        TextView title = text("Pixel Auto Backup", 27);
+        TextView title = text("오토픽셀", 27);
         title.setTypeface(null, Typeface.BOLD);
         status = text("PC 연결 대기 중", 16);
-        text("PC에 표시된 코드를 붙여넣거나 페어링 파일을 선택하세요.", 15);
-        code = new EditText(this);
-        code.setSingleLine(true);
-        code.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        code.setHint("페어링 코드");
-        page.addView(code);
-        button("PC 연결 / 재개", v -> connect());
-        button("페어링 파일 열기", v -> selectPairFile());
+        text("PC에서 새 연결 코드를 만든 뒤 입력하세요.", 15);
+
+        Switch usb = new Switch(this);
+        usb.setText("USB로 연결");
+        usb.setChecked(prefs.getBoolean("pairUSB",false));
+        page.addView(usb);
+        address = input("PC 주소 (예: 192.168.0.24)");
+        address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        address.setText(prefs.getString(usb.isChecked() ? "usbAddress" : "wifiAddress", usb.isChecked() ? "127.0.0.1" : ""));
+        usb.setOnCheckedChangeListener((button, checked) -> {
+            address.setText(prefs.getString(checked ? "usbAddress" : "wifiAddress", checked ? "127.0.0.1" : ""));
+        });
+        code = input("연결 코드 (예: 7K2M-4H9P-8TWX)");
+        code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        code.setFilters(new InputFilter[]{new InputFilter.AllCaps(),new InputFilter.LengthFilter(24)});
+        pairingStatus = text("", 14);
+        pairButton = button("연결하기", v -> pair(usb.isChecked()));
+        resume = button("기존 연결 재개", v -> startTransfer());
+        resume.setEnabled(!prefs.getString("pair","").isEmpty());
+
         button("전송 일시 중지", v -> {
             PhotosInspector inspector = PhotosInspector.active;
             if (inspector != null) inspector.pauseInspection();
@@ -86,36 +100,57 @@ public final class MainActivity extends Activity {
         page.addView(view);
         return view;
     }
-    private void button(String label, View.OnClickListener action) {
+    private EditText input(String hint) {
+        EditText view = new EditText(this);
+        view.setHint(hint);
+        view.setSingleLine(true);
+        page.addView(view);
+        return view;
+    }
+    private Button button(String label, View.OnClickListener action) {
         Button button = new Button(this);
         button.setText(label);
         button.setOnClickListener(action);
         page.addView(button);
+        return button;
     }
     private void toast(String text) { Toast.makeText(this,text,Toast.LENGTH_LONG).show(); }
-    private void connect() {
-        String entered = code.getText().toString().trim();
-        String pairing = entered.isEmpty() ? prefs.getString("pair", "") : entered;
-        try {
-            new Link(pairing, "validation-only");
-            if (!prefs.edit().putString("pair",pairing).commit()) throw new IllegalStateException("연결 정보를 저장할 수 없습니다.");
-            code.setText("");
-            startForegroundService(new Intent(this,TransferService.class));
-        } catch (Exception error) {
-            toast(error.getMessage()==null ? "페어링 코드를 확인해 주세요." : error.getMessage());
+    private void startTransfer() {
+        startForegroundService(new Intent(this,TransferService.class));
+    }
+    private void pair(boolean usb) {
+        if (pairing) return;
+        String pc = address.getText().toString().trim();
+        String input = code.getText().toString();
+        pairing = true;
+        pairButton.setEnabled(false);
+        resume.setEnabled(false);
+        pairingStatus.setText("PC에 연결 중…");
+        new Thread(() -> {
+            try {
+                String id = Pairing.device(prefs);
+                String trusted = Pairing.join(pc,input,id);
+                if (!prefs.edit().putString("pair",trusted).putBoolean("pairUSB",usb)
+                        .putString(usb ? "usbAddress" : "wifiAddress",pc).commit()) {
+                    throw new IllegalStateException("연결 정보를 저장할 수 없습니다.");
+                }
+                main.post(() -> finishPair(null));
+            } catch (Exception error) {
+                main.post(() -> finishPair(error.getMessage() == null ? "PC 연결을 확인해 주세요." : error.getMessage()));
+            }
+        }, "autopixel-pair").start();
+    }
+    private void finishPair(String error) {
+        if (isFinishing() || isDestroyed()) return;
+        pairing = false;
+        pairButton.setEnabled(true);
+        resume.setEnabled(!prefs.getString("pair","").isEmpty());
+        if (error != null) {
+            pairingStatus.setText(error);
+            return;
         }
-    }
-    private void selectPairFile() {
-        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("text/plain").addCategory(Intent.CATEGORY_OPENABLE);
-        startActivityForResult(pick,11);
-    }
-    @Override protected void onActivityResult(int request, int result, Intent data) {
-        super.onActivityResult(request,result,data);
-        if (request != 11 || result != RESULT_OK || data == null || data.getData() == null) return;
-        try (InputStream in = getContentResolver().openInputStream(data.getData())) {
-            if (in == null) throw new IllegalStateException();
-            code.setText(new String(Link.read(in,2048), StandardCharsets.UTF_8).trim());
-            connect();
-        } catch (Exception error) { toast("페어링 파일을 읽을 수 없습니다."); }
+        code.setText("");
+        pairingStatus.setText("PC 연결 정보를 저장했어요.");
+        startTransfer();
     }
 }

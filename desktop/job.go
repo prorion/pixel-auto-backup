@@ -306,9 +306,3 @@ func validSettings(c settings) bool {
 		c.Interval >= 5 && c.Interval <= 120 && (c.Transport == "wifi" || c.Transport == "usb") &&
 		strings.Contains(c.Account, "@") && !strings.ContainsAny(c.Account, " \r\n\t")
 }
-func checkedTime(now time.Time) string {
-	if now.IsZero() {
-		return ""
-	}
-	return now.Format(time.RFC3339)
-}
