@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pixel Auto Backup</title>
+<style>
+:root{font:16px/1.5 "Malgun Gothic",system-ui,sans-serif;color:#18243c;background:#f1f5fa}*{box-sizing:border-box}
+body{margin:0}main{width:min(100% - 32px,940px);margin:44px auto}h1,h2,p{margin:0 0 12px}h1{font-size:2rem}h2{font-size:1.15rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.card{background:#fff;border:1px solid #d4dce9;border-radius:14px;padding:20px;margin-bottom:16px}
+label{display:block;margin:0 0 10px;color:#334463}input,select,textarea,button{font:inherit}input:not([type=checkbox]),select,textarea{display:block;width:100%;padding:8px;border:1px solid #aab8cf;border-radius:7px;background:#fff;color:#18243c}
+button{padding:7px 12px;margin:4px 4px 4px 0;background:#eaf0ff;color:#173777;border:1px solid #9db5e8;border-radius:7px;cursor:pointer}button:disabled{opacity:.45;cursor:auto}
+progress{width:100%;height:12px;accent-color:#2254b8;margin:2px 0 12px}small{color:#52617c}#notice{min-height:24px;color:#903322}textarea{min-height:90px;resize:vertical}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#214ca5}
+@media(max-width:700px){.grid{grid-template-columns:1fr;gap:0}main{margin:24px auto}}
+</style>
+<main>
+<h1>Pixel Auto Backup</h1><p id="notice" role="status"></p>
+<section class="card" aria-labelledby="progress-title"><h2 id="progress-title">백업 진행</h2>
+<p id="phone">픽셀 연결 대기 중</p><strong id="transfer"></strong><progress id="transferBar" max="100" value="0" aria-label="묶음 전송 진행률"></progress>
+<strong id="verified"></strong><progress id="verifyBar" max="100" value="0" aria-label="전체 백업 확인 진행률"></progress>
+<p id="message"></p><button id="approve" disabled>확인된 묶음 정리</button>
+</section>
+<div class="grid">
+<section class="card"><h2>백업 설정</h2><form id="settings">
+<label>원본 폴더<input name="root" required placeholder="D:\HomeCam"></label>
+<label>구글 포토 백업 계정<input name="account" type="email" required></label>
+<label>묶음 크기 (GB)<input name="batchGB" type="number" min="1" max="1000" required></label>
+<label>픽셀에 남길 공간 (GB)<input name="reserveGB" type="number" min="0" max="1000" required></label>
+<label>상태 갱신 간격 (초)<input name="interval" type="number" min="5" max="120" required></label>
+<label><input name="autoClean" type="checkbox"> 확인된 묶음 자동 정리</label>
+<button type="submit">설정 저장</button><button type="button" id="scan">새 파일 검색</button>
+</form></section>
+<section class="card"><h2>픽셀 연결</h2>
+<label>연결 방식<select id="mode"><option value="wifi">Wi-Fi</option><option value="usb">USB</option></select></label>
+<label id="ipRow">PC 네트워크 주소<select id="address"></select></label>
+<p id="usbHint" hidden><small>데이터 케이블로 연결하고 픽셀의 USB 디버깅을 승인하세요. Windows PATH에서 ADB를 실행할 수 있어야 합니다.</small></p>
+<button id="pair">페어링 코드 만들기</button>
+<label>페어링 코드<textarea id="code" readonly></textarea></label>
+<button id="pairFile" disabled>페어링 파일 저장</button>
+<small>코드를 픽셀 앱에 붙여넣거나 파일을 픽셀에서 열어 연결하세요.</small>
+</section>
+</div>
+<section id="skippedCard" class="card" hidden><h2>백업 대상에서 제외된 파일</h2><div id="skippedCount"></div><pre id="skipped"></pre></section>
+</main>
+<script>
+const el=id=>document.getElementById(id);
+let key=location.hash.slice(1)||sessionStorage.getItem('pab-token')||'';
+if(location.hash){sessionStorage.setItem('pab-token',key);history.replaceState(null,'',location.pathname);}
+const fields=el('settings').elements;
+const gb=n=>(n/1e9).toLocaleString('ko-KR',{maximumFractionDigits:2})+' GB';
+let loaded=false, batch=0;
+async function api(url,data){
+  const res=await fetch(url,{method:data===undefined?'GET':'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});
+  if(!res.ok)throw new Error((await res.text()).trim());
+  return res.json();
+}
+function notice(message){el('notice').textContent=message;}
+function modeChanged(){const usb=el('mode').value==='usb';el('ipRow').hidden=usb;el('usbHint').hidden=!usb;}
+async function refresh(){
+  try {
+    const s=await api('/ui/status'), p=s.progress, phone=s.phone;
+    if(!loaded){
+      for(const [k,v] of Object.entries(s.settings)){if(fields[k]){if(fields[k].type==='checkbox')fields[k].checked=v;else fields[k].value=v;}}
+      el('mode').value=s.settings.transport;modeChanged();
+      for(const ip of s.ips||[]){const option=document.createElement('option');option.value=option.textContent=ip;el('address').append(option);}
+      loaded=true;
+    }
+    batch=p.batchNumber;
+    el('phone').textContent=s.last?(s.stale?'상태 수신 지연':'픽셀 연결됨')+' · '+(phone.locked?'잠금 또는 화면 꺼짐':'화면 켜짐')+' · '+(phone.charging?'충전 중':'충전기 연결 없음')+' · 마지막 수신 '+new Date(s.last).toLocaleTimeString('ko-KR'):'픽셀 연결 대기 중';
+    el('transfer').textContent=p.active?batch+'번째 묶음 전송 '+gb(p.batchReceived)+' / '+gb(p.batchBytes)+' · '+p.batchCopied+' / '+p.batchCount+'개':'활성 묶음 없음';
+    el('verified').textContent='전체 원본 백업 확인 '+gb(p.verifiedBytes)+' / '+gb(p.totalBytes)+' · '+p.verifiedCount+' / '+p.totalCount+'개';
+    el('transferBar').value=p.batchBytes?100*p.batchReceived/p.batchBytes:0;
+    el('verifyBar').value=p.totalBytes?100*p.verifiedBytes/p.totalBytes:0;
+    el('message').textContent=[p.active?'이 묶음에서 확인 '+p.batchVerified+' / '+p.batchCount+'개':'',p.cleaning?'픽셀 복사본 정리 중':'',p.lastVerified?'마지막 백업 확인 '+new Date(1000*p.lastVerified).toLocaleTimeString('ko-KR'):'',phone.message,p.current].filter(Boolean).join(' · ');
+    el('approve').disabled=!p.ready||p.cleaning;
+    el('skippedCard').hidden=!s.skippedCount;
+    el('skippedCount').textContent=s.skippedCount+'개 · 최대 30개 표시';
+    el('skipped').textContent=(s.skipped||[]).join('\n');
+  } catch(e){notice(e.message);}
+}
+async function save(){
+  const data=Object.fromEntries(new FormData(el('settings')));
+  for(const k of ['batchGB','reserveGB','interval'])data[k]=Number(data[k]);
+  data.autoClean=fields.autoClean.checked;
+  data.transport=el('mode').value;
+  await api('/ui/settings',data);
+}
+el('settings').onsubmit=async e=>{e.preventDefault();try{await save();notice('저장했어요.');await refresh();}catch(err){notice(err.message);}};
+el('mode').onchange=modeChanged;
+el('scan').onclick=async()=>{try{await api('/ui/scan',{});notice('원본 폴더를 다시 확인했어요.');await refresh();}catch(e){notice(e.message);}};
+el('approve').onclick=async()=>{try{await api('/ui/approve',{batch});notice('픽셀 복사본 정리를 승인했어요.');await refresh();}catch(e){notice(e.message);}};
+el('pair').onclick=async()=>{try{if(!el('settings').reportValidity())return;await save();const r=await api('/ui/pair',{ip:el('address').value,mode:el('mode').value});el('code').value=r.code;el('pairFile').disabled=false;notice('픽셀에서 이 코드나 페어링 파일을 열어 주세요.');}catch(e){notice(e.message);}};
+el('pairFile').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([el('code').value],{type:'text/plain'}));a.download='pixel-auto-backup-pair.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);};
+refresh();setInterval(refresh,2000);
+</script>

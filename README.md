@@ -57,3 +57,7 @@ Wi-Fi와 USB는 PC와 픽셀 사이의 복사 및 상태 전송 경로다. 연�
 - [픽셀 1의 원본 화질 백업](https://support.google.com/photos/answer/6220791?co=GENIE.Platform%3DAndroid&hl=ko)
 - [Android 공유 미디어 저장소](https://developer.android.com/training/data-storage/shared/media)
 - [Android 접근성 서비스](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService)
+
+## 시험판 실행
+
+설계와 상태 전이 검증은 [설계 문서](docs/design.md)에 정리했다. 윈도우 프로그램과 픽셀 앱을 연결하는 방법, 빌드 설정, 첫 실기기 시험은 [설치 및 시험 안내](docs/first-test.md)를 참고한다.
