@@ -41,6 +41,7 @@ public final class TransferService extends Service {
     private volatile Work lastWork;
     private volatile boolean pcRunning;
     private volatile long lastConnected;
+    private boolean syncRetry;
     private volatile JSONObject totals = new JSONObject();
     private volatile String prompt = "";
     private volatile String inspectionHint = "";
@@ -261,6 +262,15 @@ public final class TransferService extends Service {
                 .setOnlyAlertOnce(true).setOngoing(true).build());
     }
 
+    String verificationDiagnostic() {
+        JSONObject view=totals;
+        int saved=0;
+        Work w=work;
+        if(w!=null)for(Clip clip:w.clips)if(stage(w,clip)>=2)saved++;
+        if (w==null) return "PC 반영 · 확인 "+view.optInt("verifiedCount")+" / "+view.optInt("totalCount")+"개";
+        return "이번 묶음 · 폰에 확인 저장 "+saved+" / "+w.clips.size()+"개 · PC 반영 "+view.optInt("batchVerified")+"개";
+    }
+
     String status() { return currentNote(); }
 
     String lastChecked() {
@@ -315,16 +325,19 @@ public final class TransferService extends Service {
     boolean acceptsName(String name) {
         Work w = work;
         if (w == null) return false;
-        for (Clip c : w.clips) if (stage(w,c)==1 && c.name.equals(name)) return true;
+        for (Clip c : w.clips) if (stage(w,c)==1 && PhotosEvidence.clean(c.name).equals(name)) return true;
         return false;
     }
     boolean verify(String name) {
         Work w = work;
         if (!accountOK(w) || !unlocked(this)) return false;
         for (Clip c : w.clips) {
-            if (stage(w,c) != 1 || !c.name.equals(name)) continue;
+            if (stage(w,c) != 1 || !PhotosEvidence.clean(c.name).equals(name)) continue;
             try {
-                if (!sameOwnedItem(w,c,uri(w,c),false)) return false;
+                if (!sameOwnedItem(w,c,uri(w,c),false)) {
+                    inspectionHint("포토 상태 확인 · 받은 영상의 기기 위치를 확인할 수 없습니다.");
+                    return false;
+                }
                 stage(w,c,2);
                 setMessage("원본 백업 확인 · " + c.name);
                 return true;
@@ -355,7 +368,8 @@ public final class TransferService extends Service {
         if (activeLink == null) return;
         long now = SystemClock.elapsedRealtime();
         boolean urgent=changed.getAndSet(false);
-        if (now-last < (pcRunning?interval:Math.min(2,interval))*1000L && !urgent) return;
+        int delay=syncRetry?2:(pcRunning?interval:Math.min(2,interval));
+        if (now-last < delay*1000L && !urgent) return;
         last = now;
         if (!PhotosInspector.ready()) setMessage("접근성 꺼짐 · 픽셀에서 접근성 서비스를 켜 주세요.");
         try {
@@ -365,6 +379,7 @@ public final class TransferService extends Service {
             if (response.optInt("version")!=3) throw new IOException("윈도우 오토픽셀도 0.3으로 업데이트해 주세요.");
             interval = Math.max(5, Math.min(120,response.optInt("interval",15)));
             network = "";
+            syncRetry=false;
             lastConnected=SystemClock.elapsedRealtime();
             pcRunning=response.optBoolean("running");
             JSONObject view=response.optJSONObject("progress");
@@ -394,6 +409,7 @@ public final class TransferService extends Service {
             ioThread.execute(() -> process(activeLink,next));
         } catch (Exception error) {
             network = "PC 통신 대기 · " + safeMessage(error);
+            syncRetry=true;
         } finally {
             updateNotification();
         }

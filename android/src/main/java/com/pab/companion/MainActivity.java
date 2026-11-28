@@ -3,6 +3,8 @@ package com.pab.companion;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
@@ -150,8 +152,13 @@ public final class MainActivity extends Activity {
             PhotosInspector inspector=PhotosInspector.active;
             TransferService service=TransferService.running;
             String detail=inspector==null?"접근성 서비스 대기 중":inspector.diagnostic();
-            if(service!=null)detail=service.status()+"\n"+service.lastChecked()+"\n\n"+detail;
-            new AlertDialog.Builder(this).setTitle("백업 확인 진단").setMessage(detail).setPositiveButton("닫기",null).show();
+            if(service!=null)detail=service.status()+"\n"+service.lastChecked()+"\n"
+                    +service.verificationDiagnostic()+"\n\n"+detail;
+            final String diagnostic=detail;
+            new AlertDialog.Builder(this).setTitle("백업 확인 진단").setMessage(diagnostic)
+                    .setNeutralButton("복사",(dialog,which)->getSystemService(ClipboardManager.class)
+                            .setPrimaryClip(ClipData.newPlainText("오토픽셀 · 백업 확인",diagnostic)))
+                    .setPositiveButton("닫기",null).show();
         });
     }
 

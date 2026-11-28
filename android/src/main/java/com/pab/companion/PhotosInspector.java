@@ -22,21 +22,31 @@ public final class PhotosInspector extends AccessibilityService {
     private long accountActionAt;
     static boolean ready() { return active!=null; }
     private String opened = "";
-    private long openedAt;
+    private boolean scrolledDetails;
+    private String lastTarget = "";
+    private volatile String diagnostic = "구글 포토 화면을 열어 주세요.";
+    private volatile String recentDetails = "";
+    private static final class Screen {
+        final Set<String> visible=new LinkedHashSet<>();
+        final Set<String> details=new LinkedHashSet<>();
+    }
     private final Runnable followUp = new Runnable() {
         @Override public void run() {
             if (!continuous) return;
-            if (!windowLabels().isEmpty()) {
-                inspectWindow();
-                if (!opened.isEmpty() && SystemClock.elapsedRealtime() - openedAt > 8_000) opened = "";
+            Screen screen=readScreen();
+            if (!screen.visible.isEmpty()) {
+                inspectWindow(screen);
                 TransferService transfer=TransferService.running;
-                if (transfer!=null && transfer.waitingForAccount()) advanceAccount(windowLabels());
-                else openNext();
+                if (transfer!=null && transfer.waitingForAccount()) advanceAccount(screen.visible);
+                else if (lastTarget.isEmpty()) openNext();
+                else if (!scrolledDetails && TransferService.unlocked(PhotosInspector.this)
+                        && (!screen.details.isEmpty() || PhotosEvidence.details(screen.visible))) {
+                    scrolledDetails=scrollDetails(PhotosEvidence.details(screen.visible));
+                }
             }
-            main.postDelayed(this, 2000);
+            main.postDelayed(this,2000);
         }
     };
-    private volatile String diagnostic = "구글 포토 화면을 열어 주세요.";
 
     @Override protected void onServiceConnected() {
         active = this;
@@ -58,68 +68,140 @@ public final class PhotosInspector extends AccessibilityService {
         super.onDestroy();
     }
     @Override public void onInterrupt() { pauseInspection(); }
-    String diagnostic() { return diagnostic; }
+    String diagnostic() {
+        return recentDetails.isEmpty()?diagnostic:diagnostic+"\n\n최근 영상 세부정보\n"+recentDetails;
+    }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null || event.getPackageName() == null || !TransferService.PHOTOS.contentEquals(event.getPackageName())) return;
-        inspectWindow();
+        TransferService transfer=TransferService.running;
+        if (transfer==null || transfer.expectedAccount().isEmpty() || !TransferService.unlocked(this)
+                || event==null || event.getPackageName()==null
+                || !TransferService.PHOTOS.contentEquals(event.getPackageName())) return;
+        inspectWindow(readScreen());
     }
-    private void inspectWindow() {
-        TransferService transfer = TransferService.running;
-        if (transfer == null || !TransferService.unlocked(this)) return;
-        Set<String> labels = windowLabels();
-        if (labels.isEmpty()) return;
-        String expected = transfer.expectedAccount();
-        boolean account = PhotosEvidence.hasAccount(labels, expected);
-        boolean otherAccount=PhotosEvidence.otherAccount(labels,expected);
+    private void inspectWindow(Screen screen) {
+        TransferService transfer=TransferService.running;
+        if (transfer==null || !TransferService.unlocked(this) || screen.visible.isEmpty()) return;
+        String expected=transfer.expectedAccount();
+        boolean account=PhotosEvidence.hasAccount(screen.visible,expected);
+        boolean otherAccount=PhotosEvidence.otherAccount(screen.visible,expected);
         if (account) transfer.confirmAccount(expected);
         else if (otherAccount) transfer.clearAccountProof();
 
-        PhotosEvidence.Item result = PhotosEvidence.inspect(labels, transfer::acceptsName);
-        diagnostic = "포토 텍스트 " + labels.size() + "개 · 대상 파일 " + (result.name.isEmpty() ? "미확인" : "확인")
-                + " · 백업 표시 " + (result.backedUp ? "있음" : "없음")
-                + " · 원본 화질 " + (result.original ? "있음" : "없음")
-                + " · 계정 " + (transfer.readyToInspect() ? "확인" : "대기");
+        PhotosEvidence.Item result=PhotosEvidence.inspect(screen.visible,transfer::acceptsName);
+        Set<String> observed=screen.visible;
+        if (!screen.details.isEmpty() && !result.conflicts && !result.verified()) {
+            PhotosEvidence.Item attached=PhotosEvidence.inspect(screen.details,transfer::acceptsName);
+            if (!attached.name.isEmpty() && (result.name.isEmpty() || result.name.equals(attached.name))) {
+                result=attached;
+                observed=screen.details;
+            }
+        }
+        lastTarget=result.name;
+        diagnostic="현재 포토 화면 · 대상 영상 "+(result.name.isEmpty()?"미확인":"식별")
+                +" · 백업 "+(result.backedUp?"표시됨":"표시 없음")
+                +" · 원본 화질 "+(result.original?"표시됨":"표시 없음")
+                +" · 계정 "+(transfer.readyToInspect()?"확인":"대기");
+        if (!result.name.isEmpty() || recentDetails.isEmpty()
+                && (PhotosEvidence.details(screen.visible) || !screen.details.isEmpty())) {
+            String excerpts=PhotosEvidence.redactedEvidence(observed);
+            recentDetails=diagnostic+(excerpts.isEmpty()?"":"\n"+excerpts);
+        }
+
         if (result.verified() && transfer.verify(result.name)) {
             transfer.inspectionHint("");
             if (continuous) {
-                opened = "";
-                main.postDelayed(this::openNext, 350);
+                opened="";
+                scrolledDetails=false;
+                main.postDelayed(this::openNext,350);
             }
-        } else if (PhotosEvidence.backupDisabled(labels)) {
+        } else if (PhotosEvidence.backupDisabled(screen.visible)) {
             transfer.inspectionHint("구글 포토의 기본 백업을 켜 주세요.");
         } else if (otherAccount) {
             transfer.inspectionHint("구글 포토의 백업 계정을 PC 설정과 맞춰 주세요.");
-        } else if (transfer.readyToInspect() && transfer.nextUnverified()!=null) {
-            if (result.name.isEmpty()) transfer.inspectionHint("구글 포토에서 대상 영상의 세부정보를 찾는 중");
-            else if (!result.backedUp) transfer.inspectionHint("영상 복사 완료 · 구글 포토 백업 상태 대기");
-            else if (!result.original) transfer.inspectionHint("구글 포토에서 원본 화질 확인 대기");
+        } else if (transfer.nextUnverified()!=null) {
+            if (!transfer.readyToInspect()) transfer.inspectionHint("구글 포토의 설정 → 백업에서 계정을 확인해 주세요.");
+            else if (result.name.isEmpty()) transfer.inspectionHint("포토에서 대상 영상을 열고 위로 쓸어올려 주세요.");
+            else if (result.conflicts) transfer.inspectionHint("이 영상의 백업 또는 원본 화질 표시를 확인해 주세요.");
+            else if (!result.backedUp) transfer.inspectionHint("파일 확인 · 구글 포토의 영상별 백업 표시 대기");
+            else if (!result.original) transfer.inspectionHint("백업 표시 확인 · 원본 화질 표시 대기");
         }
     }
-    private Set<String> windowLabels() {
-        Set<String> labels = new LinkedHashSet<>();
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return labels;
-        try {
-            if (root.getPackageName() != null && TransferService.PHOTOS.contentEquals(root.getPackageName())) collect(root,labels,0);
-        } finally { root.recycle(); }
-        return labels;
+
+    private boolean photosWindow(AccessibilityNodeInfo root) {
+        return root.getPackageName()!=null && TransferService.PHOTOS.contentEquals(root.getPackageName());
     }
-    private void collect(AccessibilityNodeInfo node, Set<String> labels, int depth) {
-        if (depth > 32 || labels.size() >= 400 || !node.isVisibleToUser()) return;
-        String text = PhotosEvidence.clean(node.getText());
-        String desc = PhotosEvidence.clean(node.getContentDescription());
+
+    private Screen readScreen() {
+        Screen screen=new Screen();
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if (root==null) return screen;
+        try {
+            if (!photosWindow(root)) return screen;
+            collect(root,screen.visible,0,true);
+            AccessibilityNodeInfo pane=findPane(root,0);
+            if (pane!=null) try {
+                collect(pane,screen.details,0,false);
+            } finally { pane.recycle(); }
+            else if (PhotosEvidence.details(screen.visible)) collect(root,screen.details,0,false);
+        } finally { root.recycle(); }
+        return screen;
+    }
+
+    private AccessibilityNodeInfo findPane(AccessibilityNodeInfo node,int depth) {
+        if (depth>25 || !node.isVisibleToUser()) return null;
+        String id=node.getViewIdResourceName();
+        if (id!=null && id.matches(".*:id/(?:details_bottom_sheet|photo_details|media_details|info_panel|details_panel|details_container)")) {
+            return AccessibilityNodeInfo.obtain(node);
+        }
+        for (int i=0;i<node.getChildCount();i++) {
+            AccessibilityNodeInfo child=node.getChild(i);
+            if(child!=null)try {
+                AccessibilityNodeInfo match=findPane(child,depth+1);
+                if(match!=null)return match;
+            } finally { child.recycle(); }
+        }
+        return null;
+    }
+
+    private void collect(AccessibilityNodeInfo node,Set<String> labels,int depth,boolean onlyVisible) {
+        if(depth>32 || labels.size()>=400 || onlyVisible && !node.isVisibleToUser())return;
+        String text=PhotosEvidence.clean(node.getText()), desc=PhotosEvidence.clean(node.getContentDescription());
         if (!text.isEmpty()) labels.add(text);
         if (!desc.isEmpty()) labels.add(desc);
-        for (int i=0; i<node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child == null) continue;
-            try { collect(child,labels,depth+1); } finally { child.recycle(); }
+        for (int i=0;i<node.getChildCount();i++) {
+            AccessibilityNodeInfo child=node.getChild(i);
+            if(child!=null)try { collect(child,labels,depth+1,onlyVisible); } finally { child.recycle(); }
         }
     }
+
+    private boolean scrollDetails(boolean hasDetailsHeading) {
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if (root==null) return false;
+        try {
+            if (!photosWindow(root)) return false;
+            AccessibilityNodeInfo pane=findPane(root,0);
+            if(pane!=null)try { return scrollPane(pane,0); } finally { pane.recycle(); }
+            return hasDetailsHeading && scrollPane(root,0);
+        } finally { root.recycle(); }
+    }
+
+    private boolean scrollPane(AccessibilityNodeInfo node,int depth) {
+        if (depth>24 || !node.isVisibleToUser()) return false;
+        if (node.isScrollable() && node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) return true;
+        for (int i=0;i<node.getChildCount();i++) {
+            AccessibilityNodeInfo child=node.getChild(i);
+            if(child!=null)try { if(scrollPane(child,depth+1))return true; } finally { child.recycle(); }
+        }
+        return false;
+    }
+
     void beginFlow() {
         continuous = true;
         opened = "";
+        lastTarget="";
+        scrolledDetails=false;
+        recentDetails="";
         accountSteps=0;
         accountActionAt=0;
         main.removeCallbacks(followUp);
@@ -131,11 +213,9 @@ public final class PhotosInspector extends AccessibilityService {
         boolean claimed=false;
         if (labels.contains("Photos settings") || labels.contains("포토 설정")) {
             claimed=clickVisible("Photos settings","포토 설정",false);
-            if (!claimed && (labels.contains("Backup") || labels.contains("백업"))) {
-                claimed=clickVisible("Backup","백업",false);
-            }
+            if (!claimed) claimed=clickBackupSettings();
         } else if (labels.contains("Settings") || labels.contains("설정")) {
-            claimed=clickVisible("Backup","백업",false);
+            claimed=clickBackupSettings();
         } else if (accountSteps==0) {
             claimed=clickVisible("Google Account","Google 계정",true);
         }
@@ -143,6 +223,12 @@ public final class PhotosInspector extends AccessibilityService {
             accountSteps++;
             accountActionAt=SystemClock.elapsedRealtime();
         }
+    }
+
+    private boolean clickBackupSettings() {
+        return clickVisible("Backup","백업",false)
+                || clickVisible("Backup & sync","백업 및 동기화",false)
+                || clickVisible("Back up & sync","백업 및 동기화",false);
     }
 
     private boolean clickVisible(String first,String second,boolean prefixes) {
@@ -183,23 +269,34 @@ public final class PhotosInspector extends AccessibilityService {
         String name = transfer.nextName();
         if (uri == null || name.isEmpty() || name.equals(opened)) return false;
         opened = name;
-        openedAt = SystemClock.elapsedRealtime();
+        scrolledDetails=false;
         try {
             Intent view = new Intent(Intent.ACTION_VIEW).setDataAndType(uri,"video/*")
                     .setPackage(TransferService.PHOTOS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(view);
-            main.postDelayed(() -> revealDetails(name), 900);
+            main.postDelayed(() -> revealDetails(name,0),900);
             return true;
         } catch (RuntimeException error) {
-            diagnostic = "구글 포토에서 대상 영상을 직접 열고 위로 쓸어올려 주세요.";
+            diagnostic="구글 포토에서 대상 영상을 직접 열고 위로 쓸어올려 주세요.";
+            transfer.inspectionHint(diagnostic);
             return false;
         }
     }
-    private void revealDetails(String name) {
+    private void revealDetails(String name,int navigationStep) {
         if (!continuous || !opened.equals(name) || !TransferService.unlocked(this)) return;
-        Set<String> labels = windowLabels();
-        if (labels.isEmpty() || labels.contains("Details") || labels.contains("세부정보")
-                || PhotosEvidence.inspect(labels, name::equals).verified()) return;
+        Screen window=readScreen();
+        if (window.visible.isEmpty()) return;
+        String expected=PhotosEvidence.clean(name);
+        PhotosEvidence.Item full=PhotosEvidence.inspect(window.details,expected::equals);
+        PhotosEvidence.Item visible=PhotosEvidence.inspect(window.visible,expected::equals);
+        if (!full.name.isEmpty() || visible.verified()) return;
+        if (navigationStep<2 && (clickVisible("Details","세부정보",false)
+                || clickVisible("Details","세부 정보",false)
+                || navigationStep==0 && (clickVisible("More options","더보기",false)
+                || clickVisible("More options","추가 옵션",false)))) {
+            main.postDelayed(()->revealDetails(name,navigationStep+1),600);
+            return;
+        }
         DisplayMetrics screen = getResources().getDisplayMetrics();
         Path path = new Path();
         path.moveTo(screen.widthPixels * .5f, screen.heightPixels * .72f);
