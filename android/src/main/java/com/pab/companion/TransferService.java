@@ -223,11 +223,21 @@ public final class TransferService extends Service {
         return "PC 연결됨";
     }
 
-    String counts() {
+    static final class Summary {
+        int copied, batchCount, verified, total;
+        long copiedBytes, batchBytes;
+    }
+
+    /** PC totals merged with what this phone has already recorded but not yet reported. */
+    Summary summary() {
         JSONObject view=totals;
-        int total=view.optInt("totalCount"), verifiedCount=view.optInt("verifiedCount");
-        long copiedBytes=view.optLong("batchReceived"), batchBytes=view.optLong("batchBytes");
-        int batchCount=view.optInt("batchCount"), copiedCount=view.optInt("batchCopied");
+        Summary s=new Summary();
+        s.total=view.optInt("totalCount");
+        s.verified=view.optInt("verifiedCount");
+        s.copiedBytes=view.optLong("batchReceived");
+        s.batchBytes=view.optLong("batchBytes");
+        s.batchCount=view.optInt("batchCount");
+        s.copied=view.optInt("batchCopied");
         Work w=work;
         if (w!=null && w.batch==view.optInt("batchNumber")) {
             int localCopied=0, localVerified=0;
@@ -238,13 +248,19 @@ public final class TransferService extends Service {
                 else if(c.id.equals(current)) localBytes+=Math.min(c.size,bytes);
                 if (state>=2) localVerified++;
             }
-            copiedBytes=Math.max(copiedBytes,localBytes);
-            copiedCount=Math.max(copiedCount,localCopied);
-            verifiedCount+=Math.max(0,localVerified-view.optInt("batchVerified"));
+            s.copiedBytes=Math.max(s.copiedBytes,localBytes);
+            s.copied=Math.max(s.copied,localCopied);
+            s.verified+=Math.max(0,localVerified-view.optInt("batchVerified"));
         }
-        String bundle=batchCount>0 ? String.format(java.util.Locale.KOREA,"이번 묶음 전송 %,d / %,d개 · %.2f / %.2f GB",
-                copiedCount,batchCount,copiedBytes/1e9,batchBytes/1e9) : "현재 묶음 없음";
-        return bundle+"\n원본 백업 확인 "+Math.min(total,verifiedCount)+" / "+total+"개";
+        s.verified=Math.min(s.total,s.verified);
+        return s;
+    }
+
+    String counts() {
+        Summary s=summary();
+        String bundle=s.batchCount>0 ? String.format(java.util.Locale.KOREA,"이번 묶음 전송 %,d / %,d개 · %.2f / %.2f GB",
+                s.copied,s.batchCount,s.copiedBytes/1e9,s.batchBytes/1e9) : "현재 묶음 없음";
+        return bundle+"\n원본 백업 확인 "+s.verified+" / "+s.total+"개";
     }
 
     private void updateNotification() {

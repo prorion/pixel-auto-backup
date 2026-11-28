@@ -162,6 +162,19 @@ func (c *controller) saveSettings(config settings) error {
 	return c.save()
 }
 
+func (c *controller) setTransport(transport string) error {
+	if transport != "wifi" && transport != "usb" {
+		return errors.New("연결 방식을 확인해 주세요.")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.s.Settings.Transport == transport {
+		return nil
+	}
+	c.s.Settings.Transport = transport
+	return c.save()
+}
+
 func (c *controller) addMore() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

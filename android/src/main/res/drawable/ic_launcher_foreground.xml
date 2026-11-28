@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Same geometry as assets/icon.svg. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#2A395A" android:pathData="M33,29 H75 Q79,29 79,33 V75 Q79,79 75,79 H33 Q29,79 29,75 V33 Q29,29 33,29 Z"/>
-    <path android:fillColor="#21D7AB" android:pathData="M39,39 H51 V51 H39 Z M54,39 H66 V51 H54 Z M39,54 H51 V66 H39 Z"/>
-    <path android:fillColor="#A5F6E1" android:pathData="M54,54 H66 V66 H54 Z"/>
-    <path android:fillColor="#111A2E" android:pathData="M76,68 A11,11 0,1 1,54 68 A11,11 0,1 1,76 68 Z"/>
-    <path android:fillColor="#F5F8FF" android:pathData="M73,64 L64,73 L59,68 L61.3,65.7 L64,68.4 L70.7,61.7 Z"/>
+    <path android:fillColor="#3B82F6" android:pathData="M31,71.5 H34 Q35,71.5 35,72.5 V75.5 Q35,76.5 34,76.5 H31 Q30,76.5 30,75.5 V72.5 Q30,71.5 31,71.5 Z"/>
+    <path android:fillColor="#22B8D6" android:pathData="M37.8,64.5 H41.7 Q43,64.5 43,65.8 V69.7 Q43,71 41.7,71 H37.8 Q36.5,71 36.5,69.7 V65.8 Q36.5,64.5 37.8,64.5 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="
+        M29,51 a11,11 0 1,0 22,0 a11,11 0 1,0 -22,0 Z
+        M39,42 a16,16 0 1,0 32,0 a16,16 0 1,0 -32,0 Z
+        M59,52 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0 Z
+        M40,46 H69 V62 H40 Z"/>
+    <path android:strokeColor="#12B886" android:strokeWidth="5.2" android:strokeLineCap="round"
+        android:strokeLineJoin="round" android:pathData="M46.5,50.5 L53,57 L64.5,45"/>
 </vector>
