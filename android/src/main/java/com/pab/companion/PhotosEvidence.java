@@ -74,6 +74,24 @@ final class PhotosEvidence {
         return false;
     }
 
+    /** The Photos toolbar avatar that opens the Google account menu (and from there Backup). */
+    static boolean accountMenuButton(String viewId, CharSequence description) {
+        if (viewId != null && viewId.endsWith(":id/selected_account_disc")) return true;
+        String text=normal(description==null?"":description.toString());
+        // Older Photos: "Google Account: name (address)". Photos 8.x: "name address 계정으로 로그인함\n계정 및 설정."
+        return text.startsWith("google account:") || text.startsWith("google 계정:")
+                || text.matches(".*(?:account and settings|계정 및 설정)\\.?");
+    }
+
+    /** The Google account menu opened from the avatar; its Backup card leads to the backup account. */
+    static boolean accountMenu(Collection<String> labels) {
+        for (String label : labels) {
+            String text=normal(label);
+            if (text.equals("manage your google account") || text.equals("google 계정 관리")) return true;
+        }
+        return false;
+    }
+
     static boolean backupDisabled(Collection<String> labels) {
         for (String label : labels) {
             String text=normal(label);

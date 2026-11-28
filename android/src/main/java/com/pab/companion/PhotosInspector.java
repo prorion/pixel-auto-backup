@@ -211,18 +211,31 @@ public final class PhotosInspector extends AccessibilityService {
     private void advanceAccount(Set<String> labels) {
         if (accountSteps>=4 || !TransferService.unlocked(this) || SystemClock.elapsedRealtime()-accountActionAt<900) return;
         boolean claimed=false;
-        if (labels.contains("Photos settings") || labels.contains("포토 설정")) {
-            claimed=clickVisible("Photos settings","포토 설정",false);
-            if (!claimed) claimed=clickBackupSettings();
+        boolean menu=PhotosEvidence.accountMenu(labels);
+        if (menu || labels.contains("Photos settings") || labels.contains("포토 설정")) {
+            // The account menu's Backup card opens the backup overview, which names the backup account.
+            claimed=clickBackupSettings();
+            if (!claimed) claimed=clickVisible("Photos settings","포토 설정",false);
+            if (!claimed && menu) {
+                // The cards sit below the storage card and can be off-screen on small or rotated displays.
+                if (scrollWindow()) accountActionAt=SystemClock.elapsedRealtime();
+                return;
+            }
         } else if (labels.contains("Settings") || labels.contains("설정")) {
             claimed=clickBackupSettings();
         } else if (accountSteps==0) {
-            claimed=clickVisible("Google Account","Google 계정",true);
+            claimed=clickWhere((node,text,desc)->PhotosEvidence.accountMenuButton(node.getViewIdResourceName(),desc));
         }
         if (claimed) {
             accountSteps++;
             accountActionAt=SystemClock.elapsedRealtime();
         }
+    }
+
+    private boolean scrollWindow() {
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if (root==null) return false;
+        try { return photosWindow(root) && scrollPane(root,0); } finally { root.recycle(); }
     }
 
     private boolean clickBackupSettings() {
@@ -231,31 +244,47 @@ public final class PhotosInspector extends AccessibilityService {
                 || clickVisible("Back up & sync","백업 및 동기화",false);
     }
 
+    private interface Target { boolean matches(AccessibilityNodeInfo node,String text,String desc); }
+
     private boolean clickVisible(String first,String second,boolean prefixes) {
+        return clickWhere((node,text,desc)->first.equals(text) || second.equals(text) || first.equals(desc) || second.equals(desc)
+                || prefixes && (desc.startsWith(first+":") || desc.startsWith(second+":")));
+    }
+
+    private boolean clickWhere(Target target) {
         AccessibilityNodeInfo root=getRootInActiveWindow();
         if(root==null)return false;
         try {
-            return root.getPackageName()!=null && TransferService.PHOTOS.contentEquals(root.getPackageName())
-                    && clickLabel(root,first,second,prefixes,0);
+            return photosWindow(root) && clickMatch(root,target,0);
         } finally { root.recycle(); }
     }
 
-    private boolean clickLabel(AccessibilityNodeInfo node,String first,String second,boolean prefixes,int depth) {
+    private boolean clickMatch(AccessibilityNodeInfo node,Target target,int depth) {
         if(depth>24 || !node.isVisibleToUser())return false;
         String text=PhotosEvidence.clean(node.getText()), desc=PhotosEvidence.clean(node.getContentDescription());
-        if (first.equals(text) || second.equals(text) || first.equals(desc) || second.equals(desc)
-                || prefixes && (desc.startsWith(first+":") || desc.startsWith(second+":"))) {
-            if(node.isClickable())return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            AccessibilityNodeInfo parent=node.getParent();
-            if(parent!=null)try {
-                if(parent.isClickable())return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            } finally { parent.recycle(); }
-        }
+        if (target.matches(node,text,desc) && clickSelfOrAncestor(node)) return true;
         for(int i=0;i<node.getChildCount();i++){
             AccessibilityNodeInfo child=node.getChild(i);
-            if(child!=null)try { if(clickLabel(child,first,second,prefixes,depth+1))return true; }
+            if(child!=null)try { if(clickMatch(child,target,depth+1))return true; }
             finally { child.recycle(); }
         }
+        return false;
+    }
+
+    // Photos 8.x account cards keep the label several layers below the clickable card.
+    private static boolean clickSelfOrAncestor(AccessibilityNodeInfo node) {
+        if (node.isClickable()) return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        AccessibilityNodeInfo current=node.getParent();
+        for (int level=0; current!=null && level<5; level++) {
+            if (current.isClickable()) {
+                try { return current.performAction(AccessibilityNodeInfo.ACTION_CLICK); }
+                finally { current.recycle(); }
+            }
+            AccessibilityNodeInfo next=current.getParent();
+            current.recycle();
+            current=next;
+        }
+        if (current!=null) current.recycle();
         return false;
     }
     void pauseInspection() {
@@ -282,14 +311,20 @@ public final class PhotosInspector extends AccessibilityService {
             return false;
         }
     }
+    private static final int REVEAL_ATTEMPTS=6;
+
     private void revealDetails(String name,int navigationStep) {
         if (!continuous || !opened.equals(name) || !TransferService.unlocked(this)) return;
         Screen window=readScreen();
-        if (window.visible.isEmpty()) return;
         String expected=PhotosEvidence.clean(name);
         PhotosEvidence.Item full=PhotosEvidence.inspect(window.details,expected::equals);
         PhotosEvidence.Item visible=PhotosEvidence.inspect(window.visible,expected::equals);
         if (!full.name.isEmpty() || visible.verified()) return;
+        if (navigationStep>=REVEAL_ATTEMPTS) {
+            TransferService transfer=TransferService.running;
+            if (transfer!=null) transfer.inspectionHint("포토에서 대상 영상을 열고 위로 쓸어올려 주세요.");
+            return;
+        }
         if (navigationStep<2 && (clickVisible("Details","세부정보",false)
                 || clickVisible("Details","세부 정보",false)
                 || navigationStep==0 && (clickVisible("More options","더보기",false)
@@ -297,11 +332,34 @@ public final class PhotosInspector extends AccessibilityService {
             main.postDelayed(()->revealDetails(name,navigationStep+1),600);
             return;
         }
-        DisplayMetrics screen = getResources().getDisplayMetrics();
-        Path path = new Path();
-        path.moveTo(screen.widthPixels * .5f, screen.heightPixels * .72f);
-        path.lineTo(screen.widthPixels * .5f, screen.heightPixels * .34f);
-        dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path,0,320)).build(),
-                null,null);
+        // A full-screen Photos video hides its controls and exposes no text at all (Pixel 1, Photos 8.2),
+        // so recognise the viewer by its pager id. The first swipe can also land before the viewer is
+        // ready, so keep trying until the details sheet appears.
+        if (viewerOpen()) {
+            DisplayMetrics screen = getResources().getDisplayMetrics();
+            Path path = new Path();
+            path.moveTo(screen.widthPixels * .5f, screen.heightPixels * .72f);
+            path.lineTo(screen.widthPixels * .5f, screen.heightPixels * .34f);
+            dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path,0,320)).build(),
+                    null,null);
+        }
+        main.postDelayed(()->revealDetails(name,navigationStep+1),1500);
+    }
+
+    private boolean viewerOpen() {
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if (root==null) return false;
+        try { return photosWindow(root) && hasViewId(root,":id/photo_view_pager",0); } finally { root.recycle(); }
+    }
+
+    private static boolean hasViewId(AccessibilityNodeInfo node,String suffix,int depth) {
+        if (depth>20 || !node.isVisibleToUser()) return false;
+        String id=node.getViewIdResourceName();
+        if (id!=null && id.endsWith(suffix)) return true;
+        for (int i=0;i<node.getChildCount();i++) {
+            AccessibilityNodeInfo child=node.getChild(i);
+            if(child!=null)try { if(hasViewId(child,suffix,depth+1))return true; } finally { child.recycle(); }
+        }
+        return false;
     }
 }
